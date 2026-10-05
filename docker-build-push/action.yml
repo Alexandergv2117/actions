@@ -1,0 +1,160 @@
+name: "Docker Build & Push"
+description: >
+  Builds a Docker image and pushes it to a container registry, generic for
+  any app/registry. Tags the image with the short commit SHA and `latest`
+  (plus any extra tags you pass in), and exposes the resulting image refs
+  as outputs.
+author: "alexandergv2117"
+
+inputs:
+  registry:
+    description: "Container registry host (e.g. ghcr.io, docker.io, 123456789.dkr.ecr.us-east-1.amazonaws.com)."
+    required: true
+  username:
+    description: "Registry username."
+    required: true
+  password:
+    description: "Registry password or token (pass as a secret)."
+    required: true
+  app-name:
+    description: >
+      App name, appended to the image name (registry/repository/app-name).
+      Useful for monorepos with multiple apps. Leave empty for a single-app
+      repo to name the image after the repository instead.
+    required: false
+    default: ""
+  repository:
+    description: "Namespace to put the image under (e.g. owner/repo). Lower-cased automatically."
+    required: false
+    default: ${{ github.repository }}
+  image-name:
+    description: "Override the full image name (registry/namespace/app) instead of deriving it from registry/repository/app-name."
+    required: false
+    default: ""
+  dockerfile:
+    description: "Path to the Dockerfile, relative to the repo root. Defaults to the Dockerfile at the repo root; set the full path yourself for monorepos (e.g. apps/api/Dockerfile)."
+    required: false
+    default: "Dockerfile"
+  context:
+    description: "Docker build context."
+    required: false
+    default: "."
+  build-args:
+    description: "Extra build args, one KEY=VALUE per line."
+    required: false
+    default: ""
+  extra-tags:
+    description: "Extra tags to apply, one per line (in addition to `latest` and the short SHA)."
+    required: false
+    default: ""
+  push:
+    description: "Whether to push the built image to the registry."
+    required: false
+    default: "true"
+  checkout:
+    description: "Whether this action should check out the repository first. Set to false if the caller already checked it out."
+    required: false
+    default: "true"
+
+outputs:
+  image:
+    description: "Full image ref tagged with the short commit SHA (registry/namespace/app:sha)."
+    value: ${{ steps.image.outputs.image }}
+  image-latest:
+    description: "Full image ref tagged with latest (registry/namespace/app:latest)."
+    value: ${{ steps.image.outputs.image-latest }}
+  image-name:
+    description: "Image name without a tag (registry/namespace/app)."
+    value: ${{ steps.image.outputs.image-name }}
+  short-sha:
+    description: "Short (7-char) commit SHA used for the sha tag."
+    value: ${{ steps.image.outputs.short-sha }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout
+      if: ${{ inputs.checkout == 'true' }}
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Log in to registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Set image name and short SHA
+      id: image
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        REPOSITORY: ${{ inputs.repository }}
+        APP_NAME: ${{ inputs.app-name }}
+        IMAGE_NAME_OVERRIDE: ${{ inputs.image-name }}
+      run: |
+        set -euo pipefail
+
+        SHORT_SHA="${GITHUB_SHA::7}"
+
+        if [ -n "$IMAGE_NAME_OVERRIDE" ]; then
+          IMAGE_NAME="$IMAGE_NAME_OVERRIDE"
+        elif [ -n "$APP_NAME" ]; then
+          IMAGE_NAME="${REGISTRY}/${REPOSITORY,,}/${APP_NAME}"
+        else
+          IMAGE_NAME="${REGISTRY}/${REPOSITORY,,}"
+        fi
+
+        {
+          echo "short-sha=$SHORT_SHA"
+          echo "image-name=$IMAGE_NAME"
+          echo "image=${IMAGE_NAME}:${SHORT_SHA}"
+          echo "image-latest=${IMAGE_NAME}:latest"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Build image
+      shell: bash
+      env:
+        IMAGE_NAME: ${{ steps.image.outputs.image-name }}
+        SHORT_SHA: ${{ steps.image.outputs.short-sha }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        CONTEXT: ${{ inputs.context }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+        EXTRA_TAGS: ${{ inputs.extra-tags }}
+      run: |
+        set -euo pipefail
+
+        tag_args=(--tag "$IMAGE_NAME:latest" --tag "$IMAGE_NAME:$SHORT_SHA")
+        while IFS= read -r tag; do
+          [ -n "$tag" ] && tag_args+=(--tag "$IMAGE_NAME:$tag")
+        done <<< "$EXTRA_TAGS"
+
+        build_arg_args=()
+        while IFS= read -r build_arg; do
+          [ -n "$build_arg" ] && build_arg_args+=(--build-arg "$build_arg")
+        done <<< "$BUILD_ARGS"
+
+        docker build \
+          --file "$DOCKERFILE" \
+          "${tag_args[@]}" \
+          "${build_arg_args[@]}" \
+          "$CONTEXT"
+
+    - name: Push image
+      if: ${{ inputs.push == 'true' }}
+      shell: bash
+      env:
+        IMAGE_NAME: ${{ steps.image.outputs.image-name }}
+        SHORT_SHA: ${{ steps.image.outputs.short-sha }}
+        EXTRA_TAGS: ${{ inputs.extra-tags }}
+      run: |
+        set -euo pipefail
+
+        docker push "$IMAGE_NAME:latest"
+        docker push "$IMAGE_NAME:$SHORT_SHA"
+
+        while IFS= read -r tag; do
+          [ -n "$tag" ] && docker push "$IMAGE_NAME:$tag"
+        done <<< "$EXTRA_TAGS"

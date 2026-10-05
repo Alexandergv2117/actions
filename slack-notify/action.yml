@@ -1,0 +1,164 @@
+name: "Slack Deploy Notify"
+description: >
+  Sends an attractive Slack notification (Block Kit) about a deploy/workflow
+  run, generic for any project/environment. Reports status, repo, branch,
+  commit, author and a link back to the GitHub Actions run.
+author: "alexandergv2117"
+
+inputs:
+  webhook-url:
+    description: "Slack Incoming Webhook URL (pass as a secret)."
+    required: true
+  status:
+    description: >
+      Overall result to report. Typically a job's result/conclusion
+      (e.g. ${{ job.status }} or a needs.<job>.result expression).
+      One of: success, failure, cancelled (any other value is treated as failure).
+    required: true
+  environment:
+    description: "Environment the deploy targets (e.g. dev, staging, prod)."
+    required: false
+    default: "prod"
+  action-name:
+    description: "Label for the action being reported, used in the status text (e.g. Deploy, Release, Build)."
+    required: false
+    default: "Deploy"
+  status-text:
+    description: "Override the automatic status text (e.g. 'Deploy succeeded')."
+    required: false
+    default: ""
+  repo:
+    description: "Repository in owner/name form."
+    required: false
+    default: ${{ github.repository }}
+  server-url:
+    description: "GitHub server URL, used to build links."
+    required: false
+    default: ${{ github.server_url }}
+  branch:
+    description: "Branch or ref name."
+    required: false
+    default: ${{ github.ref_name }}
+  sha:
+    description: "Commit SHA."
+    required: false
+    default: ${{ github.sha }}
+  actor:
+    description: "User who triggered the run."
+    required: false
+    default: ${{ github.actor }}
+  commit-message:
+    description: "Commit message (only the first line is shown)."
+    required: false
+    default: ${{ github.event.head_commit.message }}
+  event-name:
+    description: "Name of the triggering event, shown when there is no commit message."
+    required: false
+    default: ${{ github.event_name }}
+  run-id:
+    description: "Workflow run id, used to build the run link."
+    required: false
+    default: ${{ github.run_id }}
+  run-attempt:
+    description: "Workflow run attempt, used to build the run link."
+    required: false
+    default: ${{ github.run_attempt }}
+  extra-fields:
+    description: >
+      Optional extra fields to append to the message, as a JSON array of
+      {"label": "...", "value": "..."} objects. Use it for things like
+      image tag, stack name or domain. Example:
+      '[{"label":"Image","value":"ghcr.io/org/app:1.2.3"},{"label":"Domain","value":"api.example.com"}]'
+    required: false
+    default: "[]"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Send Slack notification
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+        STATUS: ${{ inputs.status }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        ACTION_NAME: ${{ inputs.action-name }}
+        STATUS_TEXT_OVERRIDE: ${{ inputs.status-text }}
+        REPO: ${{ inputs.repo }}
+        SERVER_URL: ${{ inputs.server-url }}
+        BRANCH: ${{ inputs.branch }}
+        SHA: ${{ inputs.sha }}
+        ACTOR: ${{ inputs.actor }}
+        COMMIT_MSG: ${{ inputs.commit-message }}
+        EVENT: ${{ inputs.event-name }}
+        RUN_ID: ${{ inputs.run-id }}
+        RUN_ATTEMPT: ${{ inputs.run-attempt }}
+        EXTRA_FIELDS: ${{ inputs.extra-fields }}
+      run: |
+        set -euo pipefail
+
+        # Overall status -> emoji / headline / color
+        case "$STATUS" in
+          success)
+            EMOJI="✅"; DEFAULT_TEXT="$ACTION_NAME succeeded"; COLOR="#2eb886" ;;
+          cancelled)
+            EMOJI="⚪"; DEFAULT_TEXT="$ACTION_NAME cancelled"; COLOR="#9e9e9e" ;;
+          *)
+            EMOJI="❌"; DEFAULT_TEXT="$ACTION_NAME failed"; COLOR="#e01e5a" ;;
+        esac
+
+        STATUS_TEXT="${STATUS_TEXT_OVERRIDE:-$DEFAULT_TEXT}"
+        ENV_UPPER=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+        REPO_NAME="${REPO##*/}"
+        TITLE="$EMOJI $STATUS_TEXT · $REPO_NAME · $ENV_UPPER"
+
+        # First line of the commit message only; empty on manual runs
+        MSG="${COMMIT_MSG%%$'\n'*}"
+        [ -z "$MSG" ] && MSG="(manual run: $EVENT)"
+
+        REPO_URL="$SERVER_URL/$REPO"
+        RUN_URL="$REPO_URL/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT"
+
+        payload=$(jq -n \
+          --arg title "$TITLE" \
+          --arg color "$COLOR" \
+          --arg env "$ENV_UPPER" \
+          --arg repo "$REPO" --arg repo_url "$REPO_URL" \
+          --arg branch "$BRANCH" \
+          --arg sha "${SHA:0:7}" --arg commit_url "$REPO_URL/commit/$SHA" \
+          --arg actor "$ACTOR" \
+          --arg msg "$MSG" \
+          --arg run_url "$RUN_URL" \
+          --arg status "$STATUS" \
+          --argjson extra "$EXTRA_FIELDS" \
+          '
+          def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
+          {
+            text: $title,
+            attachments: [{
+              color: $color,
+              blocks: (
+                [
+                  { type: "header", text: { type: "plain_text", text: $title } },
+                  { type: "section", fields: (
+                      [
+                        { type: "mrkdwn", text: ("*Environment:*\n" + $env) },
+                        { type: "mrkdwn", text: ("*Repo:*\n<" + $repo_url + "|" + $repo + ">") },
+                        { type: "mrkdwn", text: ("*Branch:*\n`" + $branch + "`") },
+                        { type: "mrkdwn", text: ("*Commit:*\n<" + $commit_url + "|" + $sha + ">") },
+                        { type: "mrkdwn", text: ("*Author:*\n" + $actor) }
+                      ] + [ $extra[] | { type: "mrkdwn", text: ("*" + .label + ":*\n" + .value) } ]
+                    )
+                  },
+                  { type: "section", text: { type: "mrkdwn", text: ("*Commit:* " + ($msg | esc)) } },
+                  { type: "context", elements: [
+                    { type: "mrkdwn", text: ("status: `" + $status + "`") },
+                    { type: "mrkdwn", text: ("<" + $run_url + "|View run on GitHub>") }
+                  ]}
+                ]
+              )
+            }]
+          }')
+
+        curl -fsS -X POST -H 'Content-type: application/json' \
+          --data "$payload" "$SLACK_WEBHOOK_URL" \
+          || echo "::warning::Failed to send Slack notification"
