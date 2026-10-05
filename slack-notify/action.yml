@@ -12,7 +12,7 @@ inputs:
   status:
     description: >
       Overall result to report. Typically a job's result/conclusion
-      (e.g. ${{ job.status }} or a needs.<job>.result expression).
+      (e.g. the job.status context, or a needs.<job>.result expression).
       One of: success, failure, cancelled (any other value is treated as failure).
     required: true
   environment:
