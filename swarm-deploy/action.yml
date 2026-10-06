@@ -1,0 +1,249 @@
+name: "Docker Swarm Deploy"
+description: >
+  Deploys a stack to a remote Docker Swarm manager over SSH. Logs in to the
+  registry locally so --with-registry-auth can forward credentials, writes
+  any file-based secrets (e.g. Vault AppRole creds) and plain env vars the
+  compose file needs, then runs `docker stack deploy` against the remote
+  daemon via `DOCKER_HOST=ssh://...` — so the compose file's native
+  `${VAR}` substitution resolves from the job's own environment, no
+  separate render/envsubst step required. Stack naming follows the
+  `env-slug` + `app-name` convention (stack: `env-slug-app-name`). STACK_NAME
+  and IMAGE are both real environment variables during the deploy step, so
+  your compose file can reference `${STACK_NAME}` and `${IMAGE}` anywhere —
+  in the service's own image, in a `networks.*.aliases` entry, or even as
+  part of a service key itself (e.g. `services: ${STACK_NAME}-api:`).
+author: "alexandergv2117"
+
+inputs:
+  compose-file:
+    description: "Path to the stack/compose file, relative to the repo root."
+    required: true
+  env-slug:
+    description: "Project + environment slug (e.g. acme-crm-prod). Combined with app-name to form the stack name."
+    required: true
+  app-name:
+    description: "App name (e.g. api, web). Combined with env-slug to form the stack name."
+    required: true
+  stack-name:
+    description: "Override the computed stack name (env-slug-app-name) entirely."
+    required: false
+    default: ""
+  service-name:
+    description: >
+      Name of the service key inside the compose file, used only to build
+      the service id for the post-deploy convergence check
+      (stack-name_service-name). Defaults to app-name, which matches a
+      plain `services: api:` / `services: web:` compose file. Set this
+      explicitly if your compose file names the service differently, e.g.
+      `services: ${STACK_NAME}-api:` — in that case pass the literal
+      rendered value (e.g. "acme-crm-prod-api-api").
+    required: false
+    default: ""
+  image:
+    description: "Full image ref to deploy. Exported as IMAGE for the compose file's variable substitution."
+    required: true
+  registry:
+    description: "Container registry host (e.g. ghcr.io)."
+    required: false
+    default: "ghcr.io"
+  registry-username:
+    description: "Registry username, used for the local docker login that backs --with-registry-auth."
+    required: true
+  registry-password:
+    description: "Registry password or token (pass as a secret)."
+    required: true
+  ssh-host:
+    description: "Swarm manager SSH host."
+    required: true
+  ssh-user:
+    description: "Swarm manager SSH user."
+    required: true
+  ssh-port:
+    description: "Swarm manager SSH port."
+    required: false
+    default: "22"
+  ssh-key:
+    description: "Private key for SSH access to the Swarm manager (pass as a secret)."
+    required: true
+  ssh-known-hosts:
+    description: "Known-hosts entry for the Swarm manager. Leave empty to populate it via ssh-keyscan instead."
+    required: false
+    default: ""
+  secret-files:
+    description: >
+      File-based secrets the compose file references via `file: ${SOME_FILE}`
+      (e.g. Vault AppRole creds). One NAME=VALUE per line; each is written
+      to a private temp file and NAME is exported pointing at that file's
+      path.
+    required: false
+    default: ""
+  env-vars:
+    description: "Extra plain env vars the compose file's variable substitution needs. One KEY=VALUE per line."
+    required: false
+    default: ""
+  with-registry-auth:
+    description: "Pass --with-registry-auth to docker stack deploy."
+    required: false
+    default: "true"
+  prune:
+    description: "Pass --prune to docker stack deploy (removes services no longer in the compose file)."
+    required: false
+    default: "true"
+  verify-convergence:
+    description: "After deploying, check that the service actually ends up running the expected image (catches a silent Swarm rollback)."
+    required: false
+    default: "true"
+  extra-args:
+    description: "Extra raw arguments appended to the docker stack deploy command."
+    required: false
+    default: ""
+
+outputs:
+  stack-name:
+    description: "Computed (or overridden) stack name."
+    value: ${{ steps.stack.outputs.stack-name }}
+  service-id:
+    description: "Full Swarm service id (stack-name_service-name, service-name defaulting to app-name)."
+    value: ${{ steps.stack.outputs.service-id }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Compute stack and service names
+      id: stack
+      shell: bash
+      env:
+        ENV_SLUG: ${{ inputs.env-slug }}
+        APP_NAME: ${{ inputs.app-name }}
+        STACK_NAME_OVERRIDE: ${{ inputs.stack-name }}
+        SERVICE_NAME_OVERRIDE: ${{ inputs.service-name }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$STACK_NAME_OVERRIDE" ]; then
+          STACK_NAME="$STACK_NAME_OVERRIDE"
+        else
+          STACK_NAME="${ENV_SLUG}-${APP_NAME}"
+        fi
+
+        SERVICE_NAME="${SERVICE_NAME_OVERRIDE:-$APP_NAME}"
+
+        {
+          echo "stack-name=$STACK_NAME"
+          echo "service-id=${STACK_NAME}_${SERVICE_NAME}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Configure SSH access to the Swarm manager
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-key }}
+        SSH_HOST: ${{ inputs.ssh-host }}
+        SSH_PORT: ${{ inputs.ssh-port }}
+        SSH_KNOWN_HOSTS: ${{ inputs.ssh-known-hosts }}
+      run: |
+        set -euo pipefail
+
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        if [ -n "$SSH_KNOWN_HOSTS" ]; then
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+        else
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+        fi
+        chmod 600 ~/.ssh/known_hosts
+
+        eval "$(ssh-agent -s)"
+        echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+        echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+        ssh-add - <<< "$SSH_KEY"
+
+    - name: Write file-based secrets
+      if: ${{ inputs.secret-files != '' }}
+      shell: bash
+      env:
+        SECRET_FILES: ${{ inputs.secret-files }}
+      run: |
+        set -euo pipefail
+
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          name="${line%%=*}"
+          value="${line#*=}"
+          path="$RUNNER_TEMP/secret_${name,,}"
+          install -m 600 /dev/null "$path"
+          printf '%s' "$value" > "$path"
+          echo "$name=$path" >> "$GITHUB_ENV"
+        done <<< "$SECRET_FILES"
+
+    - name: Set extra env vars
+      if: ${{ inputs.env-vars != '' }}
+      shell: bash
+      env:
+        EXTRA_ENV_VARS: ${{ inputs.env-vars }}
+      run: |
+        set -euo pipefail
+
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          echo "$line" >> "$GITHUB_ENV"
+        done <<< "$EXTRA_ENV_VARS"
+
+    - name: Log in to registry
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        REGISTRY_USERNAME: ${{ inputs.registry-username }}
+        REGISTRY_PASSWORD: ${{ inputs.registry-password }}
+      run: |
+        set -euo pipefail
+        echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$REGISTRY_USERNAME" --password-stdin
+
+    - name: Deploy stack
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        STACK_NAME: ${{ steps.stack.outputs.stack-name }}
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        DOCKER_HOST: ssh://${{ inputs.ssh-user }}@${{ inputs.ssh-host }}:${{ inputs.ssh-port }}
+        WITH_REGISTRY_AUTH: ${{ inputs.with-registry-auth }}
+        PRUNE: ${{ inputs.prune }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+
+        args=(--compose-file "$COMPOSE_FILE")
+        [ "$WITH_REGISTRY_AUTH" = "true" ] && args+=(--with-registry-auth)
+        [ "$PRUNE" = "true" ] && args+=(--prune)
+
+        # shellcheck disable=SC2206
+        extra_args=($EXTRA_ARGS)
+
+        docker stack deploy "${args[@]}" "${extra_args[@]}" "$STACK_NAME"
+
+    - name: Verify convergence
+      if: ${{ inputs.verify-convergence == 'true' }}
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SERVICE_ID: ${{ steps.stack.outputs.service-id }}
+        DOCKER_HOST: ssh://${{ inputs.ssh-user }}@${{ inputs.ssh-host }}:${{ inputs.ssh-port }}
+      run: |
+        set -euo pipefail
+
+        RUNNING=$(docker service inspect "$SERVICE_ID" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+        echo "imagen esperada: $IMAGE"
+        echo "imagen corriendo: $RUNNING"
+        if [ "${RUNNING%%@*}" != "$IMAGE" ]; then
+          echo "::error::El servicio $SERVICE_ID quedó en otra imagen — probable rollback de Swarm"
+          docker service ps --no-trunc "$SERVICE_ID" | head -20
+          exit 1
+        fi
+
+    - name: Clean up credentials
+      if: always()
+      shell: bash
+      run: |
+        rm -f "$RUNNER_TEMP"/secret_*
+        rm -f ~/.ssh/known_hosts
+        [ -n "${SSH_AGENT_PID:-}" ] && kill "$SSH_AGENT_PID" 2>/dev/null || true
