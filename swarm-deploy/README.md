@@ -140,10 +140,14 @@ jobs:
           ssh-host: ${{ secrets.SWARM_SSH_HOST }}
           ssh-user: ${{ secrets.SWARM_SSH_USER }}
           ssh-key: ${{ secrets.SWARM_SSH_KEY }}
-          ssh-known-hosts: ${{ secrets.SWARM_SSH_KNOWN_HOSTS }}
           env-vars: |
             HOST=${{ vars.API_DOMAIN }}
 ```
+
+`ssh-known-hosts` is optional and omitted here — the action populates
+`known_hosts` for you via `ssh-keyscan` against `ssh-host:ssh-port`. See
+"Passing many app env vars + legacy-style service naming + network alias"
+further down for an example that pins it instead.
 
 Matching compose file (`infra/deploy/swarm/api.deployment.yml`):
 
@@ -189,7 +193,6 @@ deploy` parses the compose file and resolves its `${VAR}` substitutions.
     ssh-host: ${{ secrets.SWARM_SSH_HOST }}
     ssh-user: ${{ secrets.SWARM_SSH_USER }}
     ssh-key: ${{ secrets.SWARM_SSH_KEY }}
-    ssh-known-hosts: ${{ secrets.SWARM_SSH_KNOWN_HOSTS }}
     secret-files: |
       VAULT_ADDR_FILE=${{ secrets.VAULT_ADDR }}
       VAULT_SECRET_PATH_FILE=${{ secrets.VAULT_SECRET_PATH }}
@@ -260,7 +263,6 @@ Two patterns that come up together in practice:
     ssh-host: ${{ secrets.SSH_HOST }}
     ssh-user: ${{ secrets.SSH_USER }}
     ssh-key: ${{ secrets.SSH_KEY }}
-    ssh-known-hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
     env-vars: |
       BETTER_AUTH_SECRET=${{ secrets.BETTER_AUTH_SECRET }}
       DATABASE_URL=${{ secrets.DATABASE_URL }}
@@ -295,7 +297,9 @@ And a second, plainly-named service (`web`) in the same or a different
 stack that other services should still be able to reach *by the full stack
 name* — e.g. because a shared reverse-proxy or another stack's service
 resolves it that way. `aliases:` adds `${STACK_NAME}` as an extra DNS name
-for the service on that network, on top of its real service name:
+for the service on that network, on top of its real service name. This
+example also shows the optional `ssh-known-hosts` input pinned (rather than
+left empty for the `ssh-keyscan` fallback):
 
 ```yaml
 - uses: alexandergv2117/actions/swarm-deploy@main
@@ -313,6 +317,9 @@ for the service on that network, on top of its real service name:
     ssh-host: ${{ secrets.SWARM_SSH_HOST }}
     ssh-user: ${{ secrets.SWARM_SSH_USER }}
     ssh-key: ${{ secrets.SWARM_SSH_KEY }}
+    # ssh-known-hosts is optional — pass it when you want strict host-key
+    # verification instead of the default ssh-keyscan fallback (generate
+    # one with `ssh-keyscan -p <port> <host>` and store it as a secret):
     ssh-known-hosts: ${{ secrets.SWARM_SSH_KNOWN_HOSTS }}
     secret-files: |
       VAULT_ADDR_FILE=${{ secrets.VAULT_ADDR }}
@@ -395,7 +402,6 @@ jobs:
           ssh-host: ${{ secrets.SWARM_SSH_HOST }}
           ssh-user: ${{ secrets.SWARM_SSH_USER }}
           ssh-key: ${{ secrets.SWARM_SSH_KEY }}
-          ssh-known-hosts: ${{ secrets.SWARM_SSH_KNOWN_HOSTS }}
           env-vars: |
             HOST=${{ vars.API_DOMAIN }}
 
