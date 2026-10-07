@@ -27,6 +27,15 @@ inputs:
     description: "Override the automatic status text (e.g. 'Deploy succeeded')."
     required: false
     default: ""
+  title:
+    description: >
+      Full override for the notification title (shown both in the
+      notification preview/thumbnail and as the message header). When set,
+      it is used as-is instead of the auto-generated
+      "<emoji> <status-text> · <repo> · <environment>" title, so include
+      your own emoji/status text if you want one.
+    required: false
+    default: ""
   repo:
     description: "Repository in owner/name form."
     required: false
@@ -83,6 +92,7 @@ runs:
         ENVIRONMENT: ${{ inputs.environment }}
         ACTION_NAME: ${{ inputs.action-name }}
         STATUS_TEXT_OVERRIDE: ${{ inputs.status-text }}
+        TITLE_OVERRIDE: ${{ inputs.title }}
         REPO: ${{ inputs.repo }}
         SERVER_URL: ${{ inputs.server-url }}
         BRANCH: ${{ inputs.branch }}
@@ -109,7 +119,12 @@ runs:
         STATUS_TEXT="${STATUS_TEXT_OVERRIDE:-$DEFAULT_TEXT}"
         ENV_UPPER=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
         REPO_NAME="${REPO##*/}"
-        TITLE="$EMOJI $STATUS_TEXT · $REPO_NAME · $ENV_UPPER"
+
+        if [ -n "$TITLE_OVERRIDE" ]; then
+          TITLE="$TITLE_OVERRIDE"
+        else
+          TITLE="$EMOJI $STATUS_TEXT · $REPO_NAME · $ENV_UPPER"
+        fi
 
         # First line of the commit message only; empty on manual runs
         MSG="${COMMIT_MSG%%$'\n'*}"
